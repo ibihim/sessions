@@ -93,12 +93,19 @@ func Focus(ctx context.Context, s Session) error {
 		return fmt.Errorf("no window titled %q or %q", s.Name, s.Title)
 	}
 
+	// Hyprland 0.56 evaluates dispatch arguments as Lua: hl.dispatch(<arg>).
+	// A window it cannot find is only a warning with exit 0, so success is
+	// read from the reply, not the exit status.
 	cctx, cancel := context.WithTimeout(ctx, liveTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(cctx, "hyprctl", "dispatch",
-		"focuswindow", "address:"+w.Address).CombinedOutput()
+	expr := fmt.Sprintf(`hl.dsp.focus({ window = "address:%s" })`, w.Address)
+	out, err := exec.CommandContext(cctx, "hyprctl", "dispatch", expr).CombinedOutput()
+	reply := strings.TrimSpace(string(out))
 	if err != nil {
-		return fmt.Errorf("focusing window: %w: %s", err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("focusing window: %w: %s", err, reply)
+	}
+	if reply != "ok" {
+		return fmt.Errorf("focusing window: %s", reply)
 	}
 	return nil
 }
