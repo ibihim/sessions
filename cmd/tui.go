@@ -32,28 +32,32 @@ const paneText = 100
 // list, a pane shows the tail of the selected session's prompts.
 //
 // Every scan is a fresh read of disk and registry, as everywhere else in
-// the package. The picker owns no state about sessions, only a cursor
-// and a cache of what it has read for the pane.
-func runPicker(ctx context.Context, root string) error {
-	_, err := tea.NewProgram(newPicker(ctx, root), tea.WithContext(ctx)).Run()
+// the package. One runs every interval as well as after each open,
+// because the picker stays on screen while you work in other windows, and
+// gets glanced at from there. It owns no state about sessions, only a
+// cursor and a cache of what it has read for the pane.
+func runPicker(ctx context.Context, root string, every time.Duration) error {
+	_, err := tea.NewProgram(newPicker(ctx, root, every), tea.WithContext(ctx)).Run()
 	return err
 }
 
 type picker struct {
-	ctx  context.Context
-	root string
-	list list.Model
-	pane viewport.Model // the tail of the selected session's thread
+	ctx   context.Context
+	root  string
+	every time.Duration // between rescans; 0 rescans only after an open
+	list  list.Model
+	pane  viewport.Model // the tail of the selected session's thread
 
-	all     []sessions.Session // last scan, live first, newest first
-	showAll bool               // the older row was taken; the window is gone
+	all       []sessions.Session // last scan, in LiveFirst's order
+	scannedAt time.Time          // when that scan began
+	showAll   bool               // the older row was taken; the window is gone
 
 	width   int
 	prompts map[string][]sessions.Prompt // by session id; dropped on every rescan
 	shown   string                       // session id the pane is on; "" for none
 }
 
-func newPicker(ctx context.Context, root string) picker {
+func newPicker(ctx context.Context, root string, every time.Duration) picker {
 	l := list.New(nil, rowDelegate{}, 80, 24)
 	l.SetStatusBarItemName("session", "sessions")
 	l.AdditionalShortHelpKeys = func() []key.Binding {
@@ -69,6 +73,7 @@ func newPicker(ctx context.Context, root string) picker {
 	return picker{
 		ctx:     ctx,
 		root:    root,
+		every:   every,
 		list:    l,
 		pane:    viewport.New(),
 		prompts: map[string][]sessions.Prompt{},
@@ -84,6 +89,7 @@ var pickerKeys = struct{ Open, Fork key.Binding }{
 
 type scannedMsg struct {
 	all []sessions.Session
+	at  time.Time // when the scan began: two can overlap, and finish in either order
 	err error
 }
 
@@ -98,17 +104,31 @@ type promptsMsg struct {
 	err error
 }
 
+// tickMsg says the interval has come round.
+type tickMsg struct{}
+
 // scan re-reads everything. It runs off the event loop, so the screen
 // keeps drawing while the transcripts are folded.
 func (p picker) scan() tea.Cmd {
 	return func() tea.Msg {
+		at := time.Now()
 		all, err := sessions.Scan(p.root)
 		if err != nil {
 			return scannedMsg{err: err}
 		}
 		sessions.Enrich(p.ctx, all)
-		return scannedMsg{all: sessions.LiveFirst(all)}
+		return scannedMsg{all: sessions.LiveFirst(all), at: at}
 	}
+}
+
+// tick waits out one interval. Update re-arms it each time it fires, so
+// there is only ever one timer; the scans it starts can still overlap an
+// open's, which is what scannedMsg.at settles.
+func (p picker) tick() tea.Cmd {
+	if p.every == 0 {
+		return nil
+	}
+	return tea.Tick(p.every, func(time.Time) tea.Msg { return tickMsg{} })
 }
 
 // open does what `sessions open` would, minus the takeover of this
@@ -157,7 +177,7 @@ func (p picker) loadPrompts(id string) tea.Cmd {
 	}
 }
 
-func (p picker) Init() tea.Cmd { return p.scan() }
+func (p picker) Init() tea.Cmd { return tea.Batch(p.scan(), p.tick()) }
 
 func (p picker) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
@@ -165,19 +185,29 @@ func (p picker) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		p.layout(msg.Width, msg.Height)
 
+	case tickMsg:
+		cmd = tea.Batch(p.scan(), p.tick())
+
 	case scannedMsg:
 		if msg.err != nil {
 			cmd = p.list.NewStatusMessage("scan failed: " + msg.err.Error())
 			break
 		}
-		p.all = msg.all
-		// The cache goes with the scan. A rescan follows an open, and the
-		// session just opened is about to gain prompts; dropping every
-		// entry rather than that one saves threading ids through
-		// openedMsg, and a reload is tens of milliseconds.
+		// Began before the scan on screen did, so it read an older disk.
+		if msg.at.Before(p.scannedAt) {
+			break
+		}
+		p.all, p.scannedAt = msg.all, msg.at
+		// The cache goes with the scan: any session may have gained
+		// prompts since, and dropping every entry saves telling which — a
+		// reload is tens of milliseconds. The pane is not blanked with it,
+		// which on a timer would blink, but re-read where it stands and
+		// repainted when the answer lands.
 		p.prompts = map[string][]sessions.Prompt{}
-		p.shown = ""
 		cmd = p.refill()
+		if p.shown != "" {
+			cmd = tea.Batch(cmd, p.loadPrompts(p.shown))
+		}
 
 	case openedMsg:
 		note := msg.note
@@ -234,17 +264,29 @@ func (p picker) take(fork bool) (picker, tea.Cmd) {
 }
 
 // refill rebuilds the rows from the last scan, keeping the cursor on the
-// session it was on: live-first ordering moves a session you just opened
-// to the top, and the cursor should follow it there.
+// session it was on: a session you just opened moves up into the running
+// ones, and the cursor should follow it there.
 func (p *picker) refill() tea.Cmd {
 	var keep string
 	if r, ok := p.list.SelectedItem().(row); ok {
 		keep = r.s.ID
 	}
 
-	items := rows(p.all, p.showAll, time.Now())
-	cmd := p.list.SetItems(items)
-	for i, it := range items {
+	cmd := p.list.SetItems(rows(p.all, p.showAll, time.Now()))
+	// Under a filter, SetItems hands back the re-filter as a command, and
+	// until its answer lands the list has no rows: nothing to put the
+	// cursor back on, and the pane would blank for want of a selection.
+	// So it runs here instead. It is a fuzzy match over a few dozen
+	// titles, and bubbles runs it the same way itself, in SetFilterText.
+	if cmd != nil {
+		if msg, ok := cmd().(list.FilterMatchesMsg); ok {
+			p.list, _ = p.list.Update(msg)
+			cmd = nil
+		}
+	}
+	// By position among the rows on screen, which under a filter is not
+	// the position in the full list.
+	for i, it := range p.list.VisibleItems() {
 		if keep != "" && it.(row).s.ID == keep {
 			p.list.Select(i)
 			break

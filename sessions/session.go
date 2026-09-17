@@ -34,11 +34,12 @@ type Session struct {
 	// Live fields. Set only while the session's process is running, and
 	// zero-valued otherwise — a Session is complete without them, so they
 	// are omitted rather than emitted as nulls.
-	PID        int    `json:"pid,omitempty"`
-	Name       string `json:"name,omitempty"`       // session name from the registry; titles the window
-	Status     string `json:"status,omitempty"`     // "busy" or "idle"; absent for headless runs
-	Entrypoint string `json:"entrypoint,omitempty"` // "cli" for a terminal session
-	Workspace  int    `json:"workspace,omitempty"`  // Hyprland workspace; 0 when unknown
+	PID        int       `json:"pid,omitempty"`
+	LiveSince  time.Time `json:"live_since,omitzero"`  // when the process started; a resume resets it, unlike StartedAt
+	Name       string    `json:"name,omitempty"`       // session name from the registry; titles the window
+	Status     string    `json:"status,omitempty"`     // "busy" or "idle"; absent for headless runs
+	Entrypoint string    `json:"entrypoint,omitempty"` // "cli" for a terminal session
+	Workspace  int       `json:"workspace,omitempty"`  // Hyprland workspace; 0 when unknown
 }
 
 // Live reports whether the session's process is currently running.

@@ -67,22 +67,10 @@ func TestRowFilterValue(t *testing.T) {
 // already left must go to the cache and nowhere else.
 func TestPaneFollowsCursor(t *testing.T) {
 	root := t.TempDir()
-	transcript := func(id, text string) sessions.Session {
-		t.Helper()
-		dir := filepath.Join(root, "slug")
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		line := `{"type":"user","timestamp":"2026-09-02T09:47:00Z","message":{"content":"` + text + `"}}` + "\n"
-		if err := os.WriteFile(filepath.Join(dir, id+".jsonl"), []byte(line), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		return sessions.Session{ID: id, Title: id, EndedAt: time.Now()}
-	}
-	a := transcript("aaaa", "first thread")
-	b := transcript("bbbb", "second thread")
+	a := writeTranscript(t, root, "aaaa", "first thread")
+	b := writeTranscript(t, root, "bbbb", "second thread")
 
-	var m tea.Model = newPicker(t.Context(), root)
+	var m tea.Model = newPicker(t.Context(), root, 0)
 	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m, cmd := m.Update(scannedMsg{all: []sessions.Session{a, b}})
 
@@ -118,6 +106,95 @@ func TestPaneFollowsCursor(t *testing.T) {
 	if pane := m.(picker).pane.View(); !strings.Contains(pane, "second thread") {
 		t.Fatalf("pane did not follow the cursor to b:\n%s", pane)
 	}
+}
+
+// A rescan leaves the pane up. On a timer, blanking it until the re-read
+// lands would make it blink every interval; the thread stays on screen
+// and a re-read goes out for it instead.
+func TestRescanKeepsPane(t *testing.T) {
+	root := t.TempDir()
+	a := writeTranscript(t, root, "aaaa", "first thread")
+
+	var m tea.Model = newPicker(t.Context(), root, 0)
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m, cmd := m.Update(scannedMsg{all: []sessions.Session{a}})
+	for _, msg := range drain(cmd) {
+		m, _ = m.Update(msg)
+	}
+
+	m, cmd = m.Update(scannedMsg{all: []sessions.Session{a}, at: time.Now()})
+	if pane := m.(picker).pane.View(); !strings.Contains(pane, "first thread") {
+		t.Fatalf("rescan blanked the pane:\n%s", pane)
+	}
+	reread := false
+	for _, msg := range drain(cmd) {
+		if pm, ok := msg.(promptsMsg); ok && pm.id == "aaaa" {
+			reread = true
+		}
+	}
+	if !reread {
+		t.Error("rescan did not re-read the thread on screen")
+	}
+}
+
+// Scans overlap when a tick lands beside an open. The one that began
+// first read an older disk, and may not overwrite the other, whichever
+// finishes last.
+func TestStaleScanDropped(t *testing.T) {
+	older := time.Now()
+	newer := older.Add(time.Second)
+	a := sessions.Session{ID: "aaaa", EndedAt: older}
+	b := sessions.Session{ID: "bbbb", EndedAt: older}
+
+	var m tea.Model = newPicker(t.Context(), t.TempDir(), 0)
+	m, _ = m.Update(scannedMsg{all: []sessions.Session{a, b}, at: newer})
+	m, _ = m.Update(scannedMsg{all: []sessions.Session{a}, at: older})
+	if n := len(m.(picker).all); n != 2 {
+		t.Errorf("a stale scan replaced a newer one: %d sessions, want 2", n)
+	}
+}
+
+// Under a filter, a rescan keeps the cursor on the session it was on. The
+// row's place in the full list is not its place on screen, and until the
+// re-filter lands there is no place on screen at all.
+func TestRefillKeepsCursorUnderFilter(t *testing.T) {
+	t0 := time.Now()
+	a := sessions.Session{ID: "aaaa", Title: "oidc cache", EndedAt: t0}
+	b := sessions.Session{ID: "bbbb", Title: "rate limiter", EndedAt: t0}
+	c := sessions.Session{ID: "cccc", Title: "oidc discovery", EndedAt: t0}
+
+	var m tea.Model = newPicker(t.Context(), t.TempDir(), 0)
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m, _ = m.Update(scannedMsg{all: []sessions.Session{a, b, c}})
+
+	p := m.(picker)
+	p.list.SetFilterText("oidc")
+	for i, it := range p.list.VisibleItems() {
+		if it.(row).s.ID == "cccc" {
+			p.list.Select(i)
+		}
+	}
+
+	// The same sessions, reordered, so c's place in the full list moves.
+	m, _ = p.Update(scannedMsg{all: []sessions.Session{c, b, a}, at: t0})
+	if s, ok := m.(picker).selected(); !ok || s.ID != "cccc" {
+		t.Errorf("cursor on %q after rescan, want cccc", s.ID)
+	}
+}
+
+// writeTranscript puts a one-prompt transcript for id under root, and
+// returns a session for it recent enough to show.
+func writeTranscript(t *testing.T, root, id, text string) sessions.Session {
+	t.Helper()
+	dir := filepath.Join(root, "slug")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	line := `{"type":"user","timestamp":"2026-09-02T09:47:00Z","message":{"content":"` + text + `"}}` + "\n"
+	if err := os.WriteFile(filepath.Join(dir, id+".jsonl"), []byte(line), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return sessions.Session{ID: id, Title: id, EndedAt: time.Now()}
 }
 
 // drain runs a command and flattens any batch it yields into the messages

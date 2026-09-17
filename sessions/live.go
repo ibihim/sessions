@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -36,6 +37,9 @@ func Enrich(ctx context.Context, all []Session) {
 			continue
 		}
 		all[i].PID = p.PID
+		if p.StartedAt > 0 { // absent, it would read as 1970
+			all[i].LiveSince = time.UnixMilli(p.StartedAt)
+		}
 		all[i].Name = p.Name
 		all[i].Status = p.Status
 		all[i].Entrypoint = p.Entrypoint
@@ -110,22 +114,39 @@ func Focus(ctx context.Context, s Session) error {
 	return nil
 }
 
-// LiveFirst returns all with running sessions moved to the front, each
-// group still newest-first. Live sessions are the ones you can walk to;
-// everything else is history, however recent.
+// LiveFirst returns all with running sessions moved to the front. Live
+// sessions are the ones you can walk to; everything else is history,
+// however recent, and keeps the newest-first order it came in.
+//
+// The running ones are ordered by when their process started, oldest
+// first. Recency is the obvious order and the wrong one: a busy session
+// writes a record per tool call, so two busy sessions would trade places
+// on every rescan, under the cursor. Process start holds still while a
+// session runs, and one that goes live — new or resumed — joins at the
+// bottom without moving the rows above it. StartedAt would not do either:
+// a resumed session carries its old records, and with them a start that
+// may be weeks old.
 func LiveFirst(all []Session) []Session {
-	ordered := make([]Session, 0, len(all))
+	var live, rest []Session
 	for _, s := range all {
 		if s.Live() {
-			ordered = append(ordered, s)
+			live = append(live, s)
+		} else {
+			rest = append(rest, s)
 		}
 	}
-	for _, s := range all {
-		if !s.Live() {
-			ordered = append(ordered, s)
+	// Ties go to the id, so the order depends on the sessions alone and
+	// not on the order they arrived in.
+	sort.Slice(live, func(i, j int) bool {
+		if !live[i].LiveSince.Equal(live[j].LiveSince) {
+			return live[i].LiveSince.Before(live[j].LiveSince)
 		}
-	}
-	return ordered
+		return live[i].ID < live[j].ID
+	})
+
+	ordered := make([]Session, 0, len(all))
+	ordered = append(ordered, live...)
+	return append(ordered, rest...)
 }
 
 // liveProc is one entry of Claude Code's live-process registry, at
@@ -134,6 +155,7 @@ func LiveFirst(all []Session) []Session {
 type liveProc struct {
 	PID        int    `json:"pid"`
 	SessionID  string `json:"sessionId"`
+	StartedAt  int64  `json:"startedAt"`  // process start, unix milliseconds
 	Name       string `json:"name"`       // what Claude Code titles the terminal window
 	Status     string `json:"status"`     // "busy" or "idle"; absent for headless runs
 	Entrypoint string `json:"entrypoint"` // "cli" for a terminal session, "sdk-cli" headless

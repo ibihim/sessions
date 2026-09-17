@@ -33,8 +33,10 @@ session by default. `--yolo=false` turns that off.
 ### Picker
 
     sessions
+    sessions --interval 5s           # rescan every 5s rather than 30s; 0 never
 
-The last three days of sessions, running ones first. Enter opens the one
+The last three days of sessions, running ones first, in the order you
+launched them, so they hold still while they work. Enter opens the one
 under the cursor: focuses its window if it has one, opens a new one if it
 does not. `f` forks it into a new window. `/` filters by title or path. The
 selected session's prompts show underneath.
