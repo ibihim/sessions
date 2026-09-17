@@ -36,28 +36,29 @@ const paneText = 100
 // because the picker stays on screen while you work in other windows, and
 // gets glanced at from there. It owns no state about sessions, only a
 // cursor and a cache of what it has read for the pane.
-func runPicker(ctx context.Context, root string, every time.Duration) error {
-	_, err := tea.NewProgram(newPicker(ctx, root, every), tea.WithContext(ctx)).Run()
+func runPicker(ctx context.Context, catalog sessions.Catalog, provider sessions.Provider, every time.Duration) error {
+	_, err := tea.NewProgram(newPicker(ctx, catalog, provider, every), tea.WithContext(ctx)).Run()
 	return err
 }
 
 type picker struct {
-	ctx   context.Context
-	root  string
-	every time.Duration // between rescans; 0 rescans only after an open
-	list  list.Model
-	pane  viewport.Model // the tail of the selected session's thread
+	ctx      context.Context
+	catalog  sessions.Catalog
+	provider sessions.Provider
+	every    time.Duration // between rescans; 0 rescans only after an open
+	list     list.Model
+	pane     viewport.Model // the tail of the selected session's thread
 
 	all       []sessions.Session // last scan, in LiveFirst's order
 	scannedAt time.Time          // when that scan began
 	showAll   bool               // the older row was taken; the window is gone
 
 	width   int
-	prompts map[string][]sessions.Prompt // by session id; dropped on every rescan
-	shown   string                       // session id the pane is on; "" for none
+	prompts map[sessions.Identity][]sessions.Prompt // by session id; dropped on every rescan
+	shown   sessions.Identity                       // session id the pane is on; "" for none
 }
 
-func newPicker(ctx context.Context, root string, every time.Duration) picker {
+func newPicker(ctx context.Context, catalog sessions.Catalog, provider sessions.Provider, every time.Duration) picker {
 	l := list.New(nil, rowDelegate{}, 80, 24)
 	l.SetStatusBarItemName("session", "sessions")
 	l.AdditionalShortHelpKeys = func() []key.Binding {
@@ -71,12 +72,13 @@ func newPicker(ctx context.Context, root string, every time.Duration) picker {
 	// your background picked something that reads on it.
 	l.Styles.Title = lipgloss.NewStyle().Bold(true)
 	return picker{
-		ctx:     ctx,
-		root:    root,
-		every:   every,
-		list:    l,
-		pane:    viewport.New(),
-		prompts: map[string][]sessions.Prompt{},
+		ctx:      ctx,
+		catalog:  catalog,
+		provider: provider,
+		every:    every,
+		list:     l,
+		pane:     viewport.New(),
+		prompts:  map[sessions.Identity][]sessions.Prompt{},
 	}
 }
 
@@ -99,7 +101,8 @@ type openedMsg struct {
 }
 
 type promptsMsg struct {
-	id  string // the session asked for, so a late answer can be told apart
+	id  sessions.Identity // provider and ID of the session asked for
+	at  time.Time         // scan generation; older reads must not refill a fresh cache
 	ps  []sessions.Prompt
 	err error
 }
@@ -112,12 +115,8 @@ type tickMsg struct{}
 func (p picker) scan() tea.Cmd {
 	return func() tea.Msg {
 		at := time.Now()
-		all, err := sessions.Scan(p.root)
-		if err != nil {
-			return scannedMsg{err: err}
-		}
-		sessions.Enrich(p.ctx, all)
-		return scannedMsg{all: sessions.LiveFirst(all), at: at}
+		all, err := p.catalog.Scan(p.ctx, p.provider)
+		return scannedMsg{all: sessions.LiveFirst(all), at: at, err: err}
 	}
 }
 
@@ -139,41 +138,40 @@ func (p picker) tick() tea.Cmd {
 // listing is one you were already running.
 func (p picker) open(s sessions.Session, fork bool) tea.Cmd {
 	return func() tea.Msg {
-		switch {
-		case fork:
-			return openedMsg{
-				note: fmt.Sprintf("forked %q in a new window", s.Title),
-				err:  spawnWindow(p.ctx, s, true, true),
-			}
-		case s.Attached():
-			return openedMsg{
-				note: fmt.Sprintf("focused %q on workspace %d", s.Title, s.Workspace),
-				err:  sessions.Focus(p.ctx, s),
-			}
-		case s.Live():
-			return openedMsg{err: fmt.Errorf(
-				"%s is running headless (pid %d) — there is no window to open",
-				shortID(s), s.PID)}
-		default:
-			return openedMsg{
-				note: fmt.Sprintf("opened %q in a new window", s.Title),
-				err:  spawnWindow(p.ctx, s, true, false),
+		// Refresh before acting: the picker may have been open while this
+		// session exited, resumed elsewhere, or gained an ambiguous title.
+		all, err := p.catalog.Scan(p.ctx, p.provider)
+		found := false
+		for _, current := range all {
+			if current.Key() == s.Key() {
+				s, found = current, true
+				break
 			}
 		}
+		if !found {
+			if err != nil {
+				return openedMsg{err: err}
+			}
+			return openedMsg{err: fmt.Errorf("session %s is no longer in the catalog", s.Key())}
+		}
+		action, err := openingAction(s, fork)
+		if err != nil {
+			return openedMsg{err: err}
+		}
+		if action == "focus" {
+			return openedMsg{note: fmt.Sprintf("focused %q on workspace %d", s.Title, s.Workspace), err: sessions.Focus(p.ctx, s)}
+		}
+		return openedMsg{note: fmt.Sprintf("%s %q in a new window", action, s.Title), err: spawnWindow(p.ctx, s, true, fork)}
 	}
 }
 
 // loadPrompts reads one session's thread, off the event loop. The answer
 // carries the id it was asked for: holding j fires a read per row, and
 // they finish in any order.
-func (p picker) loadPrompts(id string) tea.Cmd {
+func (p picker) loadPrompts(s sessions.Session) tea.Cmd {
 	return func() tea.Msg {
-		path, err := sessions.TranscriptPath(p.root, id)
-		if err != nil {
-			return promptsMsg{id: id, err: err}
-		}
-		ps, err := sessions.NewPromptReader(path).Next()
-		return promptsMsg{id: id, ps: ps, err: err}
+		ps, err := sessions.NewSessionPromptReader(s).Next()
+		return promptsMsg{id: s.Key(), at: p.scannedAt, ps: ps, err: err}
 	}
 }
 
@@ -189,12 +187,12 @@ func (p picker) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmd = tea.Batch(p.scan(), p.tick())
 
 	case scannedMsg:
-		if msg.err != nil {
-			cmd = p.list.NewStatusMessage("scan failed: " + msg.err.Error())
-			break
-		}
 		// Began before the scan on screen did, so it read an older disk.
 		if msg.at.Before(p.scannedAt) {
+			break
+		}
+		if msg.err != nil && len(msg.all) == 0 {
+			cmd = p.list.NewStatusMessage("scan failed: " + msg.err.Error())
 			break
 		}
 		p.all, p.scannedAt = msg.all, msg.at
@@ -203,10 +201,13 @@ func (p picker) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// reload is tens of milliseconds. The pane is not blanked with it,
 		// which on a timer would blink, but re-read where it stands and
 		// repainted when the answer lands.
-		p.prompts = map[string][]sessions.Prompt{}
+		p.prompts = map[sessions.Identity][]sessions.Prompt{}
 		cmd = p.refill()
-		if p.shown != "" {
-			cmd = tea.Batch(cmd, p.loadPrompts(p.shown))
+		if s, ok := p.selected(); ok && s.Key() == p.shown {
+			cmd = tea.Batch(cmd, p.loadPrompts(s))
+		}
+		if msg.err != nil {
+			cmd = tea.Batch(cmd, p.list.NewStatusMessage("warning: "+msg.err.Error()))
 		}
 
 	case openedMsg:
@@ -219,6 +220,9 @@ func (p picker) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmd = tea.Batch(p.list.NewStatusMessage(note), p.scan())
 
 	case promptsMsg:
+		if !msg.at.Equal(p.scannedAt) {
+			break
+		}
 		// Cached whichever row the cursor is on now; painted only if it
 		// is the one the pane is waiting on. A late answer for a row you
 		// have already left would otherwise show under the wrong banner.
@@ -267,9 +271,9 @@ func (p picker) take(fork bool) (picker, tea.Cmd) {
 // session it was on: a session you just opened moves up into the running
 // ones, and the cursor should follow it there.
 func (p *picker) refill() tea.Cmd {
-	var keep string
+	var keep sessions.Identity
 	if r, ok := p.list.SelectedItem().(row); ok {
-		keep = r.s.ID
+		keep = r.s.Key()
 	}
 
 	cmd := p.list.SetItems(rows(p.all, p.showAll, time.Now()))
@@ -287,7 +291,7 @@ func (p *picker) refill() tea.Cmd {
 	// By position among the rows on screen, which under a filter is not
 	// the position in the full list.
 	for i, it := range p.list.VisibleItems() {
-		if keep != "" && it.(row).s.ID == keep {
+		if keep.ID != "" && it.(row).s.Key() == keep {
 			p.list.Select(i)
 			break
 		}
@@ -304,15 +308,16 @@ func (p *picker) refill() tea.Cmd {
 // message, because the cursor moves on keys, on filter edits and on
 // refills alike, and the pane has to follow all three.
 func (p *picker) sync() tea.Cmd {
-	id := ""
-	if s, ok := p.selected(); ok {
-		id = s.ID
+	s, selected := p.selected()
+	var id sessions.Identity
+	if selected {
+		id = s.Key()
 	}
 	if id == p.shown {
 		return nil
 	}
 	p.shown = id
-	if id == "" {
+	if id.ID == "" {
 		p.pane.SetContent("")
 		return nil
 	}
@@ -320,11 +325,8 @@ func (p *picker) sync() tea.Cmd {
 		p.show(ps, nil)
 		return nil
 	}
-	// Blank rather than the previous session's thread under this one's
-	// banner. The read takes tens of milliseconds; a wrong thread would
-	// be believed.
 	p.pane.SetContent("")
-	return p.loadPrompts(id)
+	return p.loadPrompts(s)
 }
 
 // show fills the pane with the tail of a thread, laid out the way
@@ -395,7 +397,7 @@ func (r row) FilterValue() string {
 	if r.older > 0 {
 		return ""
 	}
-	return title(r.s) + " " + where(r.s)
+	return string(r.s.Tool()) + " " + title(r.s) + " " + where(r.s)
 }
 
 // rows picks the sessions to show: everything within the window; every
@@ -489,7 +491,7 @@ func (rowDelegate) Render(w io.Writer, m list.Model, index int, item list.Item) 
 // "● headless", TITLE is cut to the same 52 runes. WHERE is dim as in the
 // listing, and last, so its reset ends nothing but itself.
 func rowText(s sessions.Session) string {
-	return fmt.Sprintf("%-10s %2s %4s %5d  %-52s  %s",
-		status(s), workspace(s), age(s.EndedAt), s.Messages,
+	return fmt.Sprintf("%-6s %-10s %2s %4s %5d  %-52s  %s",
+		s.Tool(), status(s), workspace(s), age(s.EndedAt), s.Messages,
 		truncate(title(s), 52), faint.Render(where(s)))
 }

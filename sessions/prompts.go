@@ -50,14 +50,21 @@ const interrupted = "[Request interrupted by user]"
 // answer with everything since the resume and nothing before. The
 // transcript is what the session actually sees.
 type PromptReader struct {
-	path   string
-	offset int64 // bytes of complete lines already consumed
-	n      int   // prompts emitted so far, which numbers the next one
+	path     string
+	provider Provider
+	codex    codexEvents
+	offset   int64 // bytes of complete lines already consumed
+	n        int   // prompts emitted so far, which numbers the next one
 }
 
 // NewPromptReader reads path from the beginning.
 func NewPromptReader(path string) *PromptReader {
-	return &PromptReader{path: path}
+	return &PromptReader{path: path, provider: Claude}
+}
+
+// NewSessionPromptReader follows the actual discovered transcript of either tool.
+func NewSessionPromptReader(s Session) *PromptReader {
+	return &PromptReader{path: s.Transcript, provider: s.Tool()}
 }
 
 // Next returns the prompts appended since the previous call; the first call
@@ -96,7 +103,14 @@ func (r *PromptReader) Next() ([]Prompt, error) {
 		}
 		r.offset += int64(len(line))
 
-		p, ok := promptFrom(line)
+		var p Prompt
+		var ok bool
+		if r.provider == Codex {
+			event := r.codex.read(line)
+			p, ok = event.prompt, event.isPrompt
+		} else {
+			p, ok = promptFrom(line)
+		}
 		if !ok {
 			continue
 		}

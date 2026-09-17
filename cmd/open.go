@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -14,68 +15,34 @@ import (
 )
 
 func newOpenCmd() *cobra.Command {
-	var (
-		window bool
-		yolo   bool
-		fork   bool
-	)
-
+	var window, yolo, fork bool
 	cmd := &cobra.Command{
 		Use:   "open <session>",
 		Short: "Open a session: focus its window, or resume it in this terminal",
-		Long: "Takes an id prefix or part of a title — whatever is enough to " +
-			"name one session.\n\n" +
-			"A running session already has a window, so it is focused, " +
-			"switching workspace if needed. A finished one has no window, so " +
-			"this terminal becomes it: the process moves to the session's " +
-			"directory and hands over to `claude --resume`.\n\n" +
-			"With --window a finished session opens in a new ghostty window " +
-			"instead, leaving this terminal where it is — which is what you " +
-			"want when reopening several sessions off one listing.\n\n" +
-			"With --fork the session is branched rather than opened: the " +
-			"history replays into a new session id and the original is left " +
-			"untouched. Because the fork writes its own file, this is the one " +
-			"form of open that also works on a running session — the original " +
-			"keeps its window or pid, the fork gets this terminal (or a new " +
-			"window with --window).",
+		Long: "Select by ID prefix, title, or provider:id-prefix (codex:3f2a). " +
+			"Running sessions focus their uniquely identified terminal window. " +
+			"Saved sessions resume in their original directory using claude --resume " +
+			"or codex resume. A running session without an identified window is an error.\n\n" +
+			"--window opens a new Ghostty window for a saved session. --fork creates " +
+			"a new session, leaving the original intact, and also works on live sessions. " +
+			"Permission bypass flags apply only with --window; use --yolo=false to disable them.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			root, err := sessions.DefaultRoot()
+			_, all, err := loadCatalog(cmd)
 			if err != nil {
 				return err
 			}
-			all, err := sessions.Scan(root)
-			if err != nil {
-				return err
-			}
-			sessions.Enrich(cmd.Context(), all)
-
 			s, err := resolve(all, args[0])
 			if err != nil {
 				return err
 			}
-
-			// A fork skips the gates below. Both exist to keep two processes
-			// from appending to one session file — the focus instead of a
-			// second window, the refusal on a headless pid. A fork writes a
-			// file of its own, so the collision they defend against cannot
-			// happen, and a running session becomes the most useful thing to
-			// fork: it is the one state open cannot otherwise hand you a
-			// second copy of.
-			if fork {
-				if window {
-					return openWindow(cmd, s, yolo, fork)
-				}
-				return resume(cmd, s, fork)
+			action, err := openingAction(s, fork)
+			if err != nil {
+				return err
 			}
-			if s.Attached() {
-				fmt.Fprintf(cmd.ErrOrStderr(), "focusing %q on workspace %d\n",
-					s.Title, s.Workspace)
+			if action == "focus" {
+				fmt.Fprintf(cmd.ErrOrStderr(), "focusing %q on workspace %d\n", s.Title, s.Workspace)
 				return sessions.Focus(cmd.Context(), s)
-			}
-			if s.Live() {
-				return fmt.Errorf("session %s is running headless (pid %d) — "+
-					"there is no window to open", s.ID[:8], s.PID)
 			}
 			if window {
 				return openWindow(cmd, s, yolo, fork)
@@ -83,71 +50,166 @@ func newOpenCmd() *cobra.Command {
 			return resume(cmd, s, fork)
 		},
 	}
-
-	cmd.Flags().BoolVarP(&window, "window", "w", false,
-		"open in a new ghostty window instead of taking over this terminal")
-	cmd.Flags().BoolVar(&yolo, "yolo", true,
-		"pass --dangerously-skip-permissions to the resumed session (with --window)")
-	cmd.Flags().BoolVarP(&fork, "fork", "f", false,
-		"branch into a new session id instead of opening — works even on a running session")
-
+	cmd.Flags().BoolVarP(&window, "window", "w", false, "open in a new ghostty window instead of taking over this terminal")
+	cmd.Flags().BoolVar(&yolo, "yolo", true, "bypass the selected tool's permissions and sandbox (with --window)")
+	cmd.Flags().BoolVarP(&fork, "fork", "f", false, "branch into a new session ID; also works on a running session")
 	return cmd
 }
 
-// resolve picks the one session a query names.
-//
-// The listing shows both, so either is to hand: a title is what you
-// remember, but an id prefix stays unambiguous when two sessions share a
-// name, which happens whenever you ask the same question twice.
+// openingAction is shared with the picker so neither can start a second writer.
+func openingAction(s sessions.Session, fork bool) (string, error) {
+	switch {
+	case fork:
+		return "fork", nil
+	case s.Live():
+		if s.Attached() && s.WindowAddress != "" {
+			return "focus", nil
+		}
+		return "", fmt.Errorf("session %s is running (pid %d), but its terminal window cannot be identified; use --fork for a new session", s.Key(), s.PID)
+	case s.LiveState == sessions.LiveUnknown:
+		return "", fmt.Errorf("live status for %s is unavailable; cannot safely resume it; use --fork for a new session", s.Key())
+	default:
+		return "resume", nil
+	}
+}
+
 func resolve(all []sessions.Session, query string) (sessions.Session, error) {
+	original := query
+	provider := sessions.All
+	if prefix, rest, ok := strings.Cut(query, ":"); ok && (prefix == "claude" || prefix == "codex" || prefix == "all") {
+		var err error
+		provider, err = sessions.ParseProvider(prefix)
+		if err != nil || provider == sessions.All {
+			return sessions.Session{}, fmt.Errorf("invalid selector %q: use claude:<id-prefix> or codex:<id-prefix>", original)
+		}
+		query = rest
+	}
+	if strings.TrimSpace(query) == "" {
+		return sessions.Session{}, fmt.Errorf("empty session selector")
+	}
 	var byID, byTitle []sessions.Session
 	q := strings.ToLower(query)
 	for _, s := range all {
+		if provider != sessions.All && s.Tool() != provider {
+			continue
+		}
 		switch {
-		case strings.HasPrefix(s.ID, query):
+		case strings.HasPrefix(strings.ToLower(s.ID), q):
 			byID = append(byID, s)
 		case strings.Contains(strings.ToLower(s.Title), q):
 			byTitle = append(byTitle, s)
 		}
 	}
-
-	// An id prefix is a deliberate act; a title match is a guess. Never let
-	// the guess outvote the deliberate one.
 	matches := byID
 	if len(matches) == 0 {
 		matches = byTitle
 	}
-
 	switch len(matches) {
 	case 0:
-		return sessions.Session{}, fmt.Errorf(
-			"no session matching %q — try `sessions list -a`", query)
+		return sessions.Session{}, fmt.Errorf("no session matching %q — try `sessions list -a`", original)
 	case 1:
 		return matches[0], nil
 	default:
-		// Matches are newest-first. A query loose enough to hit dozens is
-		// answered by the recent few plus a count — printing all of them
-		// buries the ones you probably meant.
-		const show = 8
-		var b strings.Builder
-		fmt.Fprintf(&b, "%q matches %d sessions:\n", query, len(matches))
-		for _, s := range matches[:min(len(matches), show)] {
-			title := s.Title
-			if title == "" {
-				title = "(untitled)"
-			}
-			fmt.Fprintf(&b, "  %s  %-4s  %s\n", s.ID[:8], age(s.EndedAt), title)
-		}
-		if len(matches) > show {
-			fmt.Fprintf(&b, "  … and %d older\n", len(matches)-show)
-		}
-		b.WriteString("name one by its id prefix")
-		return sessions.Session{}, fmt.Errorf("%s", b.String())
+		return sessions.Session{}, ambiguous(original, matches)
 	}
 }
 
-// openWindow resumes a finished session in a new ghostty window, leaving
-// this terminal alone, and says so on stderr.
+func ambiguous(query string, matches []sessions.Session) error {
+	const show = 8
+	var b strings.Builder
+	fmt.Fprintf(&b, "%q matches %d sessions:\n", query, len(matches))
+	for _, s := range matches[:min(len(matches), show)] {
+		fmt.Fprintf(&b, "  %s  %-4s  %s\n", s.Key(), age(s.EndedAt), title(s))
+	}
+	if len(matches) > show {
+		fmt.Fprintf(&b, "  … and %d older\n", len(matches)-show)
+	}
+	b.WriteString("select one with provider:id-prefix")
+	return fmt.Errorf("%s", b.String())
+}
+
+// launch keeps executable, arguments and CWD separate: session text is never
+// interpreted by a shell. Construction can be tested without starting a CLI.
+type launch struct {
+	Executable    string
+	Args          []string
+	CWD           string
+	Env           []string // explicit per-window overrides; Ghostty has its own environment
+	EnvExecutable string
+}
+
+func buildLaunch(s sessions.Session, window, yolo, fork bool) (launch, error) {
+	if s.ID == "" || strings.HasPrefix(s.ID, "-") {
+		return launch{}, fmt.Errorf("invalid session ID %q", s.ID)
+	}
+	if s.CWD == "" {
+		return launch{}, fmt.Errorf("session %s records no directory to resume in", s.Key())
+	}
+	var args []string
+	var permissionFlag string
+	switch s.Tool() {
+	case sessions.Claude:
+		args = []string{"--resume", s.ID}
+		if fork {
+			args = append(args, "--fork-session")
+		}
+		permissionFlag = "--dangerously-skip-permissions"
+	case sessions.Codex:
+		verb := "resume"
+		if fork {
+			verb = "fork"
+		}
+		args = []string{verb, s.ID}
+		permissionFlag = "--dangerously-bypass-approvals-and-sandbox"
+	default:
+		return launch{}, fmt.Errorf("unsupported provider %q", s.Provider)
+	}
+	if window && yolo {
+		args = append(args, permissionFlag)
+	}
+	return launch{Executable: string(s.Tool()), Args: args, CWD: s.CWD}, nil
+}
+
+func prepareLaunch(s sessions.Session, window, yolo, fork bool) (launch, error) {
+	l, err := buildLaunch(s, window, yolo, fork)
+	if err != nil {
+		return l, err
+	}
+	info, err := os.Stat(l.CWD)
+	if err != nil {
+		return l, fmt.Errorf("session directory %s: %w", l.CWD, err)
+	}
+	if !info.IsDir() {
+		return l, fmt.Errorf("session directory %s is not a directory", l.CWD)
+	}
+	bin, err := exec.LookPath(l.Executable)
+	if err != nil {
+		return l, fmt.Errorf("%s is not on PATH: %w", l.Executable, err)
+	}
+	// Ghostty's daemon may have a different PATH. A relative executable would
+	// also change meaning after we enter the session directory.
+	l.Executable, err = filepath.Abs(bin)
+	if err != nil {
+		return l, err
+	}
+	if window && s.Tool() == sessions.Codex {
+		home, err := sessions.DefaultCodexHome()
+		if err != nil {
+			return l, err
+		}
+		l.Env = []string{"CODEX_HOME=" + home}
+		env, err := exec.LookPath("env")
+		if err != nil {
+			return l, fmt.Errorf("env is not on PATH: %w", err)
+		}
+		l.EnvExecutable, err = filepath.Abs(env)
+		if err != nil {
+			return l, err
+		}
+	}
+	return l, err
+}
+
 func openWindow(cmd *cobra.Command, s sessions.Session, yolo, fork bool) error {
 	if err := spawnWindow(cmd.Context(), s, yolo, fork); err != nil {
 		return err
@@ -160,97 +222,46 @@ func openWindow(cmd *cobra.Command, s sessions.Session, yolo, fork bool) error {
 	return nil
 }
 
-// spawnWindow does the opening and returns without a word. The picker
-// calls it too, and has a screen of its own that stderr would write over.
-//
-// `+new-window` asks the ghostty already running to open the window, over
-// its D-Bus interface, and returns at once — the window belongs to that
-// process, not to this one, and outlives it without being detached or
-// reparented. Plain `ghostty -e` is the wrong door: it forks a second GTK
-// process, which would block here for as long as the session stayed open
-// and hold this terminal hostage to the window it just spawned.
-//
-// -e takes everything after it as the command, so claude's flags reach
-// claude rather than ghostty's own parser, unquoted and intact.
-//
-// --resume <id>, never --continue: this command has already resolved which
-// session you meant, and --continue would discard that and take whatever is
-// newest in the directory. With two sessions in one checkout — a worktree,
-// or the same question asked twice — that is reliably the wrong one.
-func spawnWindow(ctx context.Context, s sessions.Session, yolo, fork bool) error {
-	if s.CWD == "" {
-		return fmt.Errorf("session %s records no directory to resume in", shortID(s))
+func windowArgs(l launch) []string {
+	args := []string{"+new-window", "--working-directory=" + l.CWD, "-e"}
+	if len(l.Env) > 0 {
+		// +new-window does not forward Ghostty's --env configuration to
+		// the daemon. env is part of the actual executed argv instead.
+		args = append(args, l.EnvExecutable)
+		args = append(args, l.Env...)
 	}
-	if _, err := exec.LookPath("ghostty"); err != nil {
+	args = append(args, l.Executable)
+	return append(args, l.Args...)
+}
+
+func spawnWindow(ctx context.Context, s sessions.Session, yolo, fork bool) error {
+	l, err := prepareLaunch(s, true, yolo, fork)
+	if err != nil {
+		return err
+	}
+	bin, err := exec.LookPath("ghostty")
+	if err != nil {
 		return fmt.Errorf("ghostty is not on PATH: %w", err)
 	}
-
-	// claude is resolved to an absolute path here rather than handed to
-	// ghostty as a bare name for it to look up, because the two of us do not
-	// share a PATH. The window inherits its environment from the ghostty
-	// daemon, which was started at login; this process inherits yours. A
-	// claude installed under ~/.local/bin is on one and not the other.
-	//
-	// Getting this wrong is not a visible failure, which is why it is worth
-	// the sentence: when -e cannot be executed ghostty falls back to a plain
-	// shell, and +new-window has already returned success by then. The window
-	// opens in the right directory, with no session in it, and this command
-	// congratulates you.
-	//
-	// Resolving here also makes the lookup honest. Our PATH is a poor guess
-	// at the daemon's, but an absolute path needs no guessing from anyone.
-	bin, err := exec.LookPath("claude")
-	if err != nil {
-		return fmt.Errorf("claude is not on PATH: %w", err)
-	}
-
-	claude := []string{bin, "--resume", s.ID}
-	if fork {
-		claude = append(claude, "--fork-session")
-	}
-	if yolo {
-		claude = append(claude, "--dangerously-skip-permissions")
-	}
-	argv := append([]string{
-		"+new-window", "--working-directory=" + s.CWD, "-e",
-	}, claude...)
-
-	out, err := exec.CommandContext(ctx, "ghostty", argv...).CombinedOutput()
+	out, err := exec.CommandContext(ctx, bin, windowArgs(l)...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("opening window: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
 
-// resume hands this terminal over to a finished session.
-//
-// A process cannot change its parent shell's directory — but it does not
-// need to. It moves itself, then execs claude in place, so the terminal
-// you typed in becomes the session and your shell's own directory is
-// untouched when you exit.
-//
-// The move matters: --resume resolves a session id under the project
-// directory derived from the cwd, so running it anywhere else reports the
-// session as missing.
 func resume(cmd *cobra.Command, s sessions.Session, fork bool) error {
-	if s.CWD == "" {
-		return fmt.Errorf("session %s records no directory to resume in", s.ID[:8])
-	}
-	bin, err := exec.LookPath("claude")
+	l, err := prepareLaunch(s, false, false, fork)
 	if err != nil {
-		return fmt.Errorf("claude is not on PATH: %w", err)
+		return err
 	}
-	if err := os.Chdir(s.CWD); err != nil {
-		return fmt.Errorf("entering %s: %w", s.CWD, err)
+	if err := os.Chdir(l.CWD); err != nil {
+		return fmt.Errorf("entering %s: %w", l.CWD, err)
 	}
-
-	argv := []string{"claude", "--resume", s.ID}
 	verb := "resuming"
 	if fork {
-		argv = append(argv, "--fork-session")
 		verb = "forking"
 	}
-
-	fmt.Fprintf(cmd.ErrOrStderr(), "%s %q in %s\n", verb, s.Title, s.CWD)
-	return syscall.Exec(bin, argv, os.Environ())
+	fmt.Fprintf(cmd.ErrOrStderr(), "%s %q in %s\n", verb, s.Title, l.CWD)
+	return syscall.Exec(l.Executable, append([]string{l.Executable}, l.Args...), os.Environ())
 }

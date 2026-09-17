@@ -28,7 +28,7 @@ func newListCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "list",
-		Short: "List the Claude Code sessions you can return to",
+		Short: "List the Claude Code and Codex sessions you can return to",
 		Long: "Shows the sessions running in a terminal right now, with the " +
 			"Hyprland workspace each one sits on — they do not need resuming, " +
 			"only finding. Use --all for finished sessions too, newest first.\n\n" +
@@ -40,9 +40,8 @@ func newListCmd() *cobra.Command {
 			if watch && asJSON {
 				return fmt.Errorf("--watch redraws a screen; it cannot also emit JSON")
 			}
-			root, err := sessions.DefaultRoot()
-			if err != nil {
-				return err
+			if watch && interval <= 0 {
+				return fmt.Errorf("--interval must be positive with --watch")
 			}
 			// --since is a question about history, and the default listing is
 			// only the live sessions — every one of which is recent by
@@ -56,11 +55,10 @@ func newListCmd() *cobra.Command {
 			color := colorEnabled()
 
 			render := func(w io.Writer) error {
-				found, err := sessions.Scan(root)
+				_, found, err := loadCatalog(cmd)
 				if err != nil {
 					return err
 				}
-				sessions.Enrich(cmd.Context(), found)
 
 				if !all {
 					found = attached(found)
@@ -175,7 +173,7 @@ func writeSessionsText(w io.Writer, found []sessions.Session, all bool, since st
 		case all:
 			fmt.Fprintln(w, "No sessions.")
 		default:
-			fmt.Fprintln(w, "No sessions running. Use --all to see finished ones.")
+			fmt.Fprintln(w, "No verified terminal sessions. Use --all to include history and unknown live status.")
 		}
 		return nil
 	}
@@ -189,7 +187,7 @@ func writeSessionsText(w io.Writer, found []sessions.Session, all bool, since st
 	// the codes into the already-aligned lines.
 	var buf bytes.Buffer
 	tw := tabwriter.NewWriter(&buf, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "ID\tSTATUS\tWS\tAGE\tMSGS\tTITLE\tWHERE")
+	fmt.Fprintln(tw, "ID\tTOOL\tSTATUS\tWS\tAGE\tMSGS\tTITLE\tWHERE")
 	for _, s := range found {
 		title := s.Title
 		if title == "" {
@@ -203,8 +201,8 @@ func writeSessionsText(w io.Writer, found []sessions.Session, all bool, since st
 		// WHERE goes last and unbounded: it is the only column whose
 		// length is not ours to choose, and the only one worth reading in
 		// full six weeks from now.
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%s\t%s\n",
-			shortID(s), status(s), workspace(s), age(s.EndedAt), s.Messages,
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\n",
+			shortID(s), s.Tool(), status(s), workspace(s), age(s.EndedAt), s.Messages,
 			truncate(title, 52), where(s))
 	}
 	if err := tw.Flush(); err != nil {
@@ -256,8 +254,12 @@ func shortID(s sessions.Session) string {
 // running — so it is labelled by what it is.
 func status(s sessions.Session) string {
 	switch {
+	case !s.Live() && s.LiveState == sessions.LiveUnknown:
+		return "? unknown"
 	case !s.Live():
 		return "—"
+	case s.Tool() == sessions.Codex:
+		return "● running"
 	case !s.Attached():
 		return "● headless"
 	case s.Status == "":

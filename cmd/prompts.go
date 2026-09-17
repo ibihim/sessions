@@ -40,8 +40,8 @@ func newPromptsCmd() *cobra.Command {
 			"oldest at the top, so the thread reads as the progression it " +
 			"was.\n\n" +
 			"With no argument this is the session started in the current " +
-			"directory, preferring one that is still running: the pane next " +
-			"door. Name a session by id prefix or title to read any other.\n\n" +
+			"directory, preferring one that is still running. If several are " +
+			"running there, supply a selector such as codex:3f2a or claude:3f2a.\n\n" +
 			"With --follow it keeps printing as you type, appending rather " +
 			"than redrawing, so what has already scrolled past stays where it " +
 			"is. It stays on the session it resolved at startup — a new " +
@@ -57,28 +57,16 @@ func newPromptsCmd() *cobra.Command {
 					"while the session is still writing")
 			}
 
-			root, err := sessions.DefaultRoot()
+			_, all, err := loadCatalog(cmd)
 			if err != nil {
 				return err
 			}
-			all, err := sessions.Scan(root)
-			if err != nil {
-				return err
-			}
-			// Enrich is what makes "the running one" resolvable; without it
-			// every session looks equally finished.
-			sessions.Enrich(cmd.Context(), all)
 
 			s, err := pick(all, args)
 			if err != nil {
 				return err
 			}
-			path, err := sessions.TranscriptPath(root, s.ID)
-			if err != nil {
-				return err
-			}
-
-			reader := sessions.NewPromptReader(path)
+			reader := sessions.NewSessionPromptReader(s)
 			first, err := reader.Next()
 			if err != nil {
 				return err
@@ -127,16 +115,23 @@ func pick(all []sessions.Session, args []string) (sessions.Session, error) {
 	}
 
 	var newest *sessions.Session
+	var live []sessions.Session
 	for i := range all { // Scan returns newest first
 		if all[i].CWD != cwd {
 			continue
 		}
-		if all[i].Attached() {
-			return all[i], nil
+		if all[i].Live() {
+			live = append(live, all[i])
 		}
 		if newest == nil {
 			newest = &all[i]
 		}
+	}
+	if len(live) > 1 {
+		return sessions.Session{}, ambiguous("running in "+cwd, live)
+	}
+	if len(live) == 1 {
+		return live[0], nil
 	}
 	if newest != nil {
 		return *newest, nil
@@ -236,7 +231,7 @@ func banner(s sessions.Session, follow bool) string {
 	if title == "" {
 		title = "(untitled)"
 	}
-	line := fmt.Sprintf("%s  %s  %s", shortID(s), title, where(s))
+	line := fmt.Sprintf("%s:%s  %s  %s", s.Tool(), shortID(s), title, where(s))
 	if follow {
 		line += "  — following, ctrl-c to stop"
 	}

@@ -3,6 +3,7 @@ package sessions
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -52,7 +53,9 @@ func Search(historyPath string, all []Session, q string) ([]Hit, error) {
 
 	known := make(map[string]Session, len(all))
 	for _, s := range all {
-		known[s.ID] = s
+		if s.Tool() == Claude {
+			known[s.ID] = s
+		}
 	}
 
 	f, err := os.Open(historyPath)
@@ -97,6 +100,55 @@ func Search(historyPath string, all []Session, q string) ([]Hit, error) {
 		return out[i].Session.EndedAt.After(out[j].Session.EndedAt)
 	})
 	return out, nil
+}
+
+// Search keeps Claude's history-log attribution and searches Codex's actual
+// user events, which also cover editor-created threads absent from history.jsonl.
+func (c Catalog) Search(all []Session, q string) ([]Hit, error) {
+	if strings.TrimSpace(q) == "" {
+		return nil, fmt.Errorf("empty search")
+	}
+	var hits []Hit
+	var problems []error
+	var claude []Session
+	needle := strings.ToLower(q)
+	for _, s := range all {
+		if s.Tool() == Claude {
+			claude = append(claude, s)
+			continue
+		}
+		ps, err := NewSessionPromptReader(s).Next()
+		if err != nil {
+			problems = append(problems, fmt.Errorf("%s: %w", s.Key(), err))
+			continue
+		}
+		hit := Hit{Session: s}
+		for _, p := range ps {
+			if p.Kind == KindPrompt && strings.Contains(strings.ToLower(p.Text), needle) {
+				if hit.Matches == 0 {
+					hit.Prompt = oneLine(p.Text)
+				}
+				hit.Matches++
+			}
+		}
+		if hit.Matches > 0 {
+			hits = append(hits, hit)
+		}
+	}
+	if len(claude) > 0 {
+		found, err := Search(c.ClaudeHistory, claude, q)
+		hits = append(hits, found...)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			problems = append(problems, fmt.Errorf("claude search: %w", err))
+		}
+	}
+	sort.Slice(hits, func(i, j int) bool {
+		if !hits[i].Session.EndedAt.Equal(hits[j].Session.EndedAt) {
+			return hits[i].Session.EndedAt.After(hits[j].Session.EndedAt)
+		}
+		return hits[i].Session.Key().String() < hits[j].Session.Key().String()
+	})
+	return hits, errors.Join(problems...)
 }
 
 // oneLine flattens a prompt for display. Prompts are multi-line often

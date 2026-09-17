@@ -70,7 +70,7 @@ func TestPaneFollowsCursor(t *testing.T) {
 	a := writeTranscript(t, root, "aaaa", "first thread")
 	b := writeTranscript(t, root, "bbbb", "second thread")
 
-	var m tea.Model = newPicker(t.Context(), root, 0)
+	var m tea.Model = newPicker(t.Context(), sessions.Catalog{ClaudeRoot: root}, sessions.Claude, 0)
 	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m, cmd := m.Update(scannedMsg{all: []sessions.Session{a, b}})
 
@@ -81,7 +81,7 @@ func TestPaneFollowsCursor(t *testing.T) {
 			loaded = pm
 		}
 	}
-	if loaded.id != "aaaa" {
+	if loaded.id != a.Key() {
 		t.Fatalf("asked for %q, want the row under the cursor, aaaa", loaded.id)
 	}
 	m, _ = m.Update(loaded)
@@ -90,7 +90,7 @@ func TestPaneFollowsCursor(t *testing.T) {
 	}
 
 	// A late answer for a row the cursor is not on may not paint.
-	m, _ = m.Update(promptsMsg{id: "bbbb", ps: []sessions.Prompt{
+	m, _ = m.Update(promptsMsg{id: b.Key(), ps: []sessions.Prompt{
 		{N: 1, Kind: sessions.KindPrompt, Text: "second thread"}}})
 	if pane := m.(picker).pane.View(); strings.Contains(pane, "second thread") {
 		t.Fatalf("a stale answer painted:\n%s", pane)
@@ -115,7 +115,7 @@ func TestRescanKeepsPane(t *testing.T) {
 	root := t.TempDir()
 	a := writeTranscript(t, root, "aaaa", "first thread")
 
-	var m tea.Model = newPicker(t.Context(), root, 0)
+	var m tea.Model = newPicker(t.Context(), sessions.Catalog{ClaudeRoot: root}, sessions.Claude, 0)
 	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m, cmd := m.Update(scannedMsg{all: []sessions.Session{a}})
 	for _, msg := range drain(cmd) {
@@ -128,7 +128,7 @@ func TestRescanKeepsPane(t *testing.T) {
 	}
 	reread := false
 	for _, msg := range drain(cmd) {
-		if pm, ok := msg.(promptsMsg); ok && pm.id == "aaaa" {
+		if pm, ok := msg.(promptsMsg); ok && pm.id == a.Key() {
 			reread = true
 		}
 	}
@@ -146,7 +146,7 @@ func TestStaleScanDropped(t *testing.T) {
 	a := sessions.Session{ID: "aaaa", EndedAt: older}
 	b := sessions.Session{ID: "bbbb", EndedAt: older}
 
-	var m tea.Model = newPicker(t.Context(), t.TempDir(), 0)
+	var m tea.Model = newPicker(t.Context(), sessions.Catalog{ClaudeRoot: t.TempDir()}, sessions.Claude, 0)
 	m, _ = m.Update(scannedMsg{all: []sessions.Session{a, b}, at: newer})
 	m, _ = m.Update(scannedMsg{all: []sessions.Session{a}, at: older})
 	if n := len(m.(picker).all); n != 2 {
@@ -163,7 +163,7 @@ func TestRefillKeepsCursorUnderFilter(t *testing.T) {
 	b := sessions.Session{ID: "bbbb", Title: "rate limiter", EndedAt: t0}
 	c := sessions.Session{ID: "cccc", Title: "oidc discovery", EndedAt: t0}
 
-	var m tea.Model = newPicker(t.Context(), t.TempDir(), 0)
+	var m tea.Model = newPicker(t.Context(), sessions.Catalog{ClaudeRoot: t.TempDir()}, sessions.Claude, 0)
 	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
 	m, _ = m.Update(scannedMsg{all: []sessions.Session{a, b, c}})
 
@@ -194,7 +194,7 @@ func writeTranscript(t *testing.T, root, id, text string) sessions.Session {
 	if err := os.WriteFile(filepath.Join(dir, id+".jsonl"), []byte(line), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return sessions.Session{ID: id, Title: id, EndedAt: time.Now()}
+	return sessions.Session{Provider: sessions.Claude, ID: id, Title: id, EndedAt: time.Now(), Transcript: filepath.Join(dir, id+".jsonl")}
 }
 
 // drain runs a command and flattens any batch it yields into the messages
@@ -212,4 +212,43 @@ func drain(cmd tea.Cmd) []tea.Msg {
 		return out
 	}
 	return []tea.Msg{msg}
+}
+
+func TestPickerIdentityAndStalePromptGeneration(t *testing.T) {
+	root := t.TempDir()
+	a := writeTranscript(t, root, "same", "Claude thread")
+	b := a
+	b.Provider = sessions.Codex
+	b.Transcript = filepath.Join(root, "codex.jsonl")
+	if err := os.WriteFile(b.Transcript, []byte(`{"type":"event_msg","payload":{"type":"user_message","message":"Codex thread"}}`+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	at := time.Now()
+	var m tea.Model = newPicker(t.Context(), sessions.Catalog{ClaudeRoot: root}, sessions.All, 0)
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 100, Height: 30})
+	m, cmd := m.Update(scannedMsg{all: []sessions.Session{a, b}, at: at})
+	for _, msg := range drain(cmd) {
+		m, _ = m.Update(msg)
+	}
+	m, cmd = m.Update(tea.KeyPressMsg{Code: 'j', Text: "j"})
+	for _, msg := range drain(cmd) {
+		m, _ = m.Update(msg)
+	}
+	if pane := m.(picker).pane.View(); !strings.Contains(pane, "Codex thread") || strings.Contains(pane, "Claude thread") {
+		t.Fatalf("cross-provider cache collision: %s", pane)
+	}
+	m, cmd = m.Update(scannedMsg{all: []sessions.Session{b, a}, at: at.Add(time.Second)})
+	if selected, _ := m.(picker).selected(); selected.Key() != b.Key() {
+		t.Fatalf("refresh switched provider: %+v", selected)
+	}
+	for _, msg := range drain(cmd) {
+		m, _ = m.Update(msg)
+	}
+	m, _ = m.Update(promptsMsg{id: b.Key(), at: at, ps: []sessions.Prompt{{N: 1, Kind: sessions.KindPrompt, Text: "obsolete read"}}})
+	if pane := m.(picker).pane.View(); !strings.Contains(pane, "Codex thread") || strings.Contains(pane, "obsolete") {
+		t.Fatalf("stale generation overwrote pane: %s", pane)
+	}
+	if ps := m.(picker).prompts[b.Key()]; len(ps) != 1 || ps[0].Text != "Codex thread" {
+		t.Fatalf("stale generation refilled cache: %+v", ps)
+	}
 }

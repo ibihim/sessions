@@ -17,7 +17,7 @@ func newFindCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "find <text>",
 		Short: "Find a session by something you typed in it",
-		Long: "Searches the prompts you typed, not what Claude replied — " +
+		Long: "Searches the prompts you typed, excluding assistant replies — " +
 			"you remember your own words. <text> is a plain substring: " +
 			"matched anywhere in a prompt, ignoring case, with no regex " +
 			"or wildcards — quote it if it contains spaces. Sessions " +
@@ -25,24 +25,16 @@ func newFindCmd() *cobra.Command {
 			"resumed or read.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			root, err := sessions.DefaultRoot()
+			catalog, all, err := loadCatalog(cmd)
 			if err != nil {
 				return err
 			}
-			history, err := sessions.DefaultHistory()
+			hits, err := catalog.Search(all, args[0])
 			if err != nil {
-				return err
-			}
-
-			all, err := sessions.Scan(root)
-			if err != nil {
-				return err
-			}
-			sessions.Enrich(cmd.Context(), all)
-
-			hits, err := sessions.Search(history, all, args[0])
-			if err != nil {
-				return err
+				if len(hits) == 0 {
+					return err
+				}
+				fmt.Fprintln(cmd.ErrOrStderr(), "warning:", err)
 			}
 
 			if asJSON {
@@ -69,7 +61,7 @@ func writeHitsText(cmd *cobra.Command, hits []sessions.Hit) error {
 	// prompts directly would align every hit in isolation, against nothing.
 	var buf bytes.Buffer
 	tw := tabwriter.NewWriter(&buf, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "ID\tSTATUS\tWS\tAGE\tMSGS\tTITLE\tWHERE")
+	fmt.Fprintln(tw, "ID\tTOOL\tSTATUS\tWS\tAGE\tMSGS\tTITLE\tWHERE")
 	for _, h := range hits {
 		s := h.Session
 		title := s.Title
@@ -79,8 +71,8 @@ func writeHitsText(cmd *cobra.Command, hits []sessions.Hit) error {
 		if title == "" {
 			title = "(untitled)"
 		}
-		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%d\t%s\t%s\n",
-			shortID(s), status(s), workspace(s), age(s.EndedAt), s.Messages,
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\n",
+			shortID(s), s.Tool(), status(s), workspace(s), age(s.EndedAt), s.Messages,
 			truncate(title, 52), where(s))
 	}
 	if err := tw.Flush(); err != nil {

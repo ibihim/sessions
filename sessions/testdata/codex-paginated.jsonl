@@ -1,0 +1,16 @@
+{"timestamp":"2026-09-17T10:00:00Z","ordinal":0,"type":"session_meta","payload":{"id":"paginated","timestamp":"2026-09-17T09:59:00Z","cwd":"/work/original","cli_version":"0.154.0","source":"cli","git":{"branch":"main"}}}
+{"timestamp":"2026-09-17T10:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"INJECTED instructions"}]}}
+{"timestamp":"2026-09-17T10:00:02Z","type":"event_msg","payload":{"type":"task_started","turn_id":"first"}}
+{"timestamp":"2026-09-17T10:00:03Z","type":"event_msg","payload":{"type":"user_message","message":"continue"}}
+{"timestamp":"2026-09-17T10:00:03.002Z","type":"event_msg","payload":{"type":"item_completed","thread_id":"paginated","turn_id":"first","item":{"type":"UserMessage","id":"prompt-1","content":[{"type":"text","text":"continue"}]}}}
+{"timestamp":"2026-09-17T10:00:04Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"first","item":{"type":"AgentMessage","id":"reply-1","content":[{"type":"Text","text":"ASSISTANT ONLY"}]}}}
+{"timestamp":"2026-09-17T10:00:04.002Z","type":"event_msg","payload":{"type":"agent_message","message":"ASSISTANT ONLY"}}
+{"timestamp":"2026-09-17T10:00:05Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"first","item":{"type":"CommandExecution","id":"tool-1","stdout":"TOOL ONLY"}}}
+{"timestamp":"2026-09-17T10:00:06Z","type":"event_msg","payload":{"type":"task_started","turn_id":"second"}}
+{"timestamp":"2026-09-17T10:00:07Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"second","item":{"type":"UserMessage","id":"prompt-2","content":[{"type":"text","text":"continue"}]}}}
+{"timestamp":"2026-09-17T10:00:08Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"second","item":{"type":"UserMessage","id":"prompt-3","content":[{"type":"local_image","path":"/tmp/image.png"}]}}}
+{"timestamp":"2026-09-17T10:00:08.002Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"second","item":{"type":"UserMessage","id":"prompt-3","content":[{"type":"local_image","path":"/tmp/image.png"}]}}}
+{"timestamp":"2026-09-17T10:00:09Z","type":"turn_context","payload":{"cwd":"/work/drifted"}}
+{"timestamp":"2026-09-17T10:00:10Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"second","reason":"interrupted"}}
+{"broken":
+{"timestamp":"2026-09-17T10:00:11Z","type":"event_msg","payload":{"type":"future_event","message":"NOT A PROMPT"}}

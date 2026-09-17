@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -42,25 +43,44 @@ const maxLine = 8 << 20
 // scan — a half-written file from a live session should not break the
 // listing.
 func Scan(root string) ([]Session, error) {
-	paths, err := filepath.Glob(filepath.Join(root, "*", "*.jsonl"))
+	projects, err := os.ReadDir(root)
 	if err != nil {
-		return nil, fmt.Errorf("globbing transcripts: %w", err)
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
 	}
-
+	var problems []error
+	var paths []string
+	for _, project := range projects {
+		if !project.IsDir() {
+			continue
+		}
+		dir := filepath.Join(root, project.Name())
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			problems = append(problems, err)
+			continue
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() && filepath.Ext(entry.Name()) == ".jsonl" {
+				paths = append(paths, filepath.Join(dir, entry.Name()))
+			}
+		}
+	}
 	sessions := make([]Session, 0, len(paths))
 	for _, path := range paths {
 		s, err := foldFile(path)
 		if err != nil {
+			problems = append(problems, err)
 			continue
 		}
 		s.Subagents = readSubagents(path)
 		sessions = append(sessions, s)
 	}
 
-	sort.Slice(sessions, func(i, j int) bool {
-		return sessions[i].EndedAt.After(sessions[j].EndedAt)
-	})
-	return sessions, nil
+	sortSessions(sessions)
+	return sessions, errors.Join(problems...)
 }
 
 // record is the slice of a transcript line this package cares about.
@@ -103,7 +123,7 @@ func foldFile(path string) (Session, error) {
 	}
 	defer f.Close()
 
-	s := Session{ID: sessionID(path)}
+	s := Session{Provider: Claude, ID: sessionID(path), Transcript: path, LiveState: LiveUnknown}
 
 	// The two title kinds are folded separately because order across kinds
 	// means nothing: "ai-title" is re-emitted on every resume, so after a
@@ -203,6 +223,10 @@ func readSubagents(path string) []Subagent {
 		})
 	}
 	return subs
+}
+
+func sortSubagents(subs []Subagent) {
+	sort.Slice(subs, func(i, j int) bool { return subs[i].ID < subs[j].ID })
 }
 
 // TranscriptPath returns the file a session was folded from.

@@ -1,0 +1,11 @@
+{"timestamp":"2026-09-16T10:00:00Z","type":"session_meta","payload":{"id":"legacy","cwd":"/work/repo","cli_version":"0.154.0","source":"vscode","git":{"branch":"feature"}}}
+{"timestamp":"2026-09-16T10:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"INJECTED instructions"}]}}
+{"timestamp":"2026-09-16T10:00:02Z","type":"event_msg","payload":{"type":"task_started","turn_id":"first"}}
+{"timestamp":"2026-09-16T10:00:03Z","type":"event_msg","payload":{"type":"user_message","message":"Find the needle\n  keep indentation","images":["image-data"],"local_images":[]}}
+{"timestamp":"2026-09-16T10:00:04Z","type":"event_msg","payload":{"type":"agent_message","message":"ASSISTANT ONLY"}}
+{"timestamp":"2026-09-16T10:00:05Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ASSISTANT ONLY"}]}}
+{"timestamp":"2026-09-16T10:00:06Z","type":"event_msg","payload":{"type":"exec_command_end","output":"TOOL ONLY"}}
+{"timestamp":"2026-09-16T10:00:07Z","type":"event_msg","payload":{"type":"turn_aborted","turn_id":"first","reason":"interrupted"}}
+{"timestamp":"2026-09-16T10:00:08Z","type":"event_msg","payload":{"type":"task_started","turn_id":"second"}}
+{"timestamp":"2026-09-16T10:00:09Z","type":"event_msg","payload":{"type":"user_message","message":"Find the needle\n  keep indentation","images":["image-data"]}}
+{"timestamp":"2026-09-16T10:00:10Z","type":"future_record","payload":{"type":"unknown"}}
