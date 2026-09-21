@@ -7,6 +7,12 @@ from `$CODEX_HOME/sessions` (default `~/.codex/sessions`). List both tools,
 search what you typed, replay your prompts, and return to a conversation.
 Run bare for the picker; the commands below work without the UI.
 
+Built for Linux with Hyprland and Ghostty; that is where everything
+works. It also builds for macOS, where listing, search, prompts, the
+picker, and Claude's live status work. Codex's live status is unknown
+there, so its sessions can only be forked, and windows can be neither
+focused nor opened. Windows is not supported.
+
 Both providers are enabled by default. Every command accepts
 `--provider all|claude|codex`. Missing stores are fine; failures in one
 provider produce warnings while the other remains usable.
@@ -15,33 +21,37 @@ provider produce warnings while the other remains usable.
 
     go install github.com/ibihim/sessions@latest
 
+From a checkout, `make install` puts it in `~/.local/bin` as `,sessions`;
+`NAME` and `BINDIR` override either.
+
 ## Requirements
 
-Saved history can be read on Linux and macOS. Opening a session requires
-its provider's CLI (`claude` or `codex`) on `PATH` and its recorded working
-directory to still exist.
+Opening a session requires its provider's CLI (`claude` or `codex`) on
+`PATH` and its recorded working directory to still exist.
 
 - **Linux `/proc`**: Codex live detection verifies held writer locks and
-  process start times. Saved `source: "cli"` metadata does not imply a live
-  terminal. Codex busy/idle status is left unset because locks establish
-  only that the process is running.
+  reads process start times. Saved `source: "cli"` metadata does not imply
+  a live terminal. Codex busy/idle status is left unset because locks
+  establish only that the process is running.
 - **Hyprland** (`hyprctl`): workspace display and focusing existing terminal
   windows. Duplicate or unmatched titles have no focus target. Codex titles
   can be `session title | project name`, with an optional activity glyph;
   a project name alone cannot identify a session.
-- **Ghostty**: `open --window` and the picker's resume/fork actions. The CLI
-  is passed as an absolute path, and Codex's home is passed to the new window.
+- **Ghostty** on Linux (its `+new-window` is GTK-only): `open --window` and
+  the picker's resume/fork actions. The CLI is passed as an absolute path,
+  and Codex's home is passed to the new window.
 
-On unsupported platforms or with restricted process access, live status is
-`unknown`, not `stopped`. History remains readable. `open` refuses to resume
-when liveness is unknown, or when a known running session has no identified
-window; `--fork` can still create a separate conversation. Focusing an editor
-conversation is outside this version's scope; saved editor sessions resume
-through the Codex CLI.
+Where liveness cannot be established (Codex off Linux, or a restricted
+process view), live status is `unknown`, not `stopped`. History remains
+readable. `open` refuses to resume when liveness is unknown, or when a known
+running session has no identified window; `--fork` can still create a
+separate conversation. Focusing an editor conversation is outside this
+version's scope; saved editor sessions resume through the Codex CLI.
 
-`open --window` enables permission bypass by default: Claude receives
+Opening in a new window bypasses permissions: Claude receives
 `--dangerously-skip-permissions`; Codex receives
-`--dangerously-bypass-approvals-and-sandbox`. `--yolo=false` disables this.
+`--dangerously-bypass-approvals-and-sandbox`. For `open --window`,
+`--yolo=false` disables this; the picker's resume and fork always bypass.
 Opening in the current terminal adds neither flag.
 
 ## Usage
@@ -57,7 +67,8 @@ launched them, so they hold still while they work. Enter opens the one
 under the cursor: focuses a running session's identified window, or resumes
 a stopped session in a new window. `f` forks it into a new window. `/` filters by title or path. The
 selected session's prompts show underneath. The `TOOL` column distinguishes
-Claude from Codex, and Codex subagents are grouped under their parent.
+Claude from Codex. Codex subagents are not listed; `--json` shows them as
+their parent's `subagents`.
 
 ### list
 
