@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"image/color"
 	"io"
 	"strings"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"charm.land/bubbles/v2/viewport"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	xansi "github.com/charmbracelet/x/ansi" // ansi is color_test.go's escape matcher
 
 	"github.com/ibihim/sessions/sessions"
 )
@@ -175,13 +177,20 @@ func (p picker) loadPrompts(s sessions.Session) tea.Cmd {
 	}
 }
 
-func (p picker) Init() tea.Cmd { return tea.Batch(p.scan(), p.tick()) }
+func (p picker) Init() tea.Cmd {
+	return tea.Batch(p.scan(), p.tick(), tea.RequestBackgroundColor)
+}
 
 func (p picker) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		p.layout(msg.Width, msg.Height)
+
+	case tea.BackgroundColorMsg:
+		// The answer to Init's question. Nothing waits on it: a terminal
+		// that never answers keeps the "> " and goes without the band.
+		p.list.SetDelegate(rowDelegate{band: cursorBand(msg)})
 
 	case tickMsg:
 		cmd = tea.Batch(p.scan(), p.tick())
@@ -440,8 +449,12 @@ func title(s sessions.Session) string {
 // as a whole, a live one has its marker painted. The two never nest, which
 // matters — an inner reset would end the outer dim early. The cursor row
 // is drawn at full brightness whatever its state, so it stands out from
-// the dim rows around it.
-type rowDelegate struct{}
+// the dim rows around it, and on a band the width of the screen, so the
+// eye can follow it to the end: past the top few rows, a "> " alone does
+// not hold a line that long.
+type rowDelegate struct {
+	band color.Color // under the cursor row; nil until the terminal reports its background
+}
 
 func (rowDelegate) Height() int                         { return 1 }
 func (rowDelegate) Spacing() int                        { return 0 }
@@ -453,7 +466,19 @@ var (
 	yellow = lipgloss.NewStyle().Foreground(lipgloss.Color("3"))
 )
 
-func (rowDelegate) Render(w io.Writer, m list.Model, index int, item list.Item) {
+// cursorBand is the colour of the band: the terminal's own background, a
+// shade lighter — darker on a light theme. The 16-colour palette has no
+// slot for it: colour 0 is often the background itself, and 8 is a grey
+// meant for text, loud as a background. Derived from the background, the
+// band is still the theme's own choice, which is what color.go asks for.
+func cursorBand(bg tea.BackgroundColorMsg) color.Color {
+	if bg.IsDark() {
+		return lipgloss.Lighten(bg.Color, 0.06)
+	}
+	return lipgloss.Darken(bg.Color, 0.06)
+}
+
+func (d rowDelegate) Render(w io.Writer, m list.Model, index int, item list.Item) {
 	r, ok := item.(row)
 	if !ok {
 		return
@@ -482,7 +507,16 @@ func (rowDelegate) Render(w io.Writer, m list.Model, index int, item list.Item) 
 	if selected {
 		cursor = "> "
 	}
-	fmt.Fprint(w, lipgloss.NewStyle().MaxWidth(m.Width()).Render(cursor+line))
+	style := lipgloss.NewStyle().MaxWidth(m.Width())
+	if selected && d.band != nil {
+		// The band is laid under plain text. A terminal cannot nest one
+		// colour in another: the reset that ends the green ● or the dim
+		// path would end the band with it. Inline stops an overlong row
+		// wrapping to a second line, so Width only pads out to the edge.
+		style = style.Background(d.band).Inline(true).Width(m.Width())
+		line = xansi.Strip(line)
+	}
+	fmt.Fprint(w, style.Render(cursor+line))
 }
 
 // rowText lays the columns out at fixed widths rather than through

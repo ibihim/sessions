@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"image/color"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
 	"github.com/ibihim/sessions/sessions"
 )
@@ -60,6 +62,68 @@ func TestRowFilterValue(t *testing.T) {
 	if v := (row{s: s}).FilterValue(); !strings.Contains(v, "oidc cache") || !strings.Contains(v, "kubernetes") {
 		t.Errorf("FilterValue = %q, want title and path", v)
 	}
+}
+
+// Once the terminal has said what its background is, the cursor row lies
+// on a band as wide as the screen. The band has to survive the whole row:
+// every escape on it either lays the band or closes it at the very end,
+// since a reset anywhere else — the green ●'s, say — would end it there.
+func TestCursorBand(t *testing.T) {
+	a := sessions.Session{ID: "aaaa", Title: "oidc cache", CWD: "/tmp/kubernetes", EndedAt: time.Now(), PID: 1, Entrypoint: "cli"}
+	b := sessions.Session{ID: "bbbb", Title: "rate limiter", CWD: "/tmp/openshift", EndedAt: time.Now()}
+
+	var m tea.Model = newPicker(t.Context(), sessions.Catalog{ClaudeRoot: t.TempDir()}, sessions.Claude, 0)
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m, _ = m.Update(scannedMsg{all: []sessions.Session{a, b}})
+	if cur := viewLine(t, m, "oidc cache"); strings.Contains(cur, "\x1b[48;") {
+		t.Errorf("band before the terminal reported its background: %q", cur)
+	}
+
+	m, _ = m.Update(tea.BackgroundColorMsg{Color: color.RGBA{0x19, 0x1d, 0x2b, 0xff}})
+	cur := viewLine(t, m, "oidc cache")
+	band := ansi.FindString(cur)
+	if !strings.HasPrefix(band, "\x1b[48;") || !strings.HasPrefix(cur, band) {
+		t.Fatalf("cursor row does not open on the band: %q", cur)
+	}
+	for _, at := range ansi.FindAllStringIndex(cur, -1) {
+		seq, rest := cur[at[0]:at[1]], cur[at[1]:]
+		closes := (seq == "\x1b[m" || seq == "\x1b[0m") && (rest == "" || strings.HasPrefix(rest, band))
+		if seq != band && !closes {
+			t.Errorf("%q at byte %d breaks the band: %q", seq, at[0], cur)
+		}
+	}
+	if w := lipgloss.Width(cur); w != 120 {
+		t.Errorf("band is %d columns wide, want all 120", w)
+	}
+	if other := viewLine(t, m, "rate limiter"); strings.Contains(other, "\x1b[48;") {
+		t.Errorf("band under a row the cursor is not on: %q", other)
+	}
+}
+
+// The band sits a shade off the background, toward the text: lighter on a
+// dark theme, darker on a light one. Lightened, white would stay white.
+func TestCursorBandShade(t *testing.T) {
+	sum := func(c color.Color) uint32 { r, g, b, _ := c.RGBA(); return r + g + b }
+	dark, light := color.RGBA{0x19, 0x1d, 0x2b, 0xff}, color.RGBA{0xff, 0xff, 0xff, 0xff}
+	if got := cursorBand(tea.BackgroundColorMsg{Color: dark}); sum(got) <= sum(dark) {
+		t.Errorf("band on %v is %v, want lighter", dark, got)
+	}
+	if got := cursorBand(tea.BackgroundColorMsg{Color: light}); sum(got) >= sum(light) {
+		t.Errorf("band on %v is %v, want darker", light, got)
+	}
+}
+
+// viewLine is the first line of the picker's screen that shows text. The
+// list is drawn above the pane, so a title finds its row before its banner.
+func viewLine(t *testing.T, m tea.Model, text string) string {
+	t.Helper()
+	for _, l := range strings.Split(m.(picker).View().Content, "\n") {
+		if strings.Contains(l, text) {
+			return l
+		}
+	}
+	t.Fatalf("no line shows %q", text)
+	return ""
 }
 
 // The pane follows the cursor, and only the answer for the row under the
